@@ -220,4 +220,4 @@ def callback_query(call):
             bot.answer_callback_query(call.id, "⚠️ No process is running to stop.")
 
 # Run Bot Polling
-bot.polling()
+bot.infinity_polling()
